@@ -183,6 +183,7 @@ body.typing .tally{position:static}
 <section id="v-home" hidden>
   <div id="demoNote" class="note plain" hidden>Trial mode. Bills are read on this device and nothing is saved.</div>
   <div id="filingNote" class="note plain" role="status" hidden></div>
+  <div id="oldBackend" class="note" hidden></div>
   <h2>What are you entering?</h2>
   <div class="stack" style="margin-top:12px">
     <div class="seg" role="group" aria-label="Type">
@@ -1318,7 +1319,8 @@ function saveCurrent(force) {
   go.then(function (yes) {
     if (!yes) return;
     busy('Saving to ' + TAB[b.kind], 0.6);
-    var pay = payload(b, rv), scans = pay.files; pay.files = [];
+    var pay = payload(b, rv), scans = [];
+    if (!S.oldBackend) { scans = pay.files; pay.files = []; }
     return api('save', { kind: b.kind, bills: [pay], force: !!force }).then(function (j) {
       idle();
       var r = j.results[0];
@@ -1344,7 +1346,7 @@ function fileLater(job, tryNo) {
   api('attach', job).then(function () { filing--; drawFiling(); }).catch(function (e) {
     if (tryNo < 2 && S.token) return setTimeout(function () { fileLater(job, tryNo + 1); }, 4000);
     filing--; drawFiling();
-    toast('Bill ' + job.billNo + ' is saved in the sheet, but its scan was not filed in Drive: ' + e.message, 9000);
+    toast('Bill ' + job.billNo + ' is saved in the sheet, but its scan was not filed in Drive: ' + (/unknown request/i.test(e.message) ? 'the new script version is not published yet.' : e.message), 9000);
   });
 }
 
@@ -1472,7 +1474,13 @@ function saveSettings() {
 function prepConnect() {
   $('urlBlock').hidden = !!S.url; $('btnChangeUrl').hidden = !S.url; $('inUrl').value = S.url || ''; $('inPass').value = ''; $('connectErr').hidden = true;
 }
+var NEEDS = '1.2.0';
+function older(a, b) { var x = String(a || '0').split('.'), y = String(b).split('.'); for (var i = 0; i < 3; i++) { var d = (Number(x[i]) || 0) - (Number(y[i]) || 0); if (d) return d < 0; } return false; }
 function enter(j) {
+  S.backend = S.demo ? NEEDS : (j.version || '1.0.0');
+  S.oldBackend = older(S.backend, NEEDS);
+  $('oldBackend').hidden = !S.oldBackend;
+  $('oldBackend').textContent = 'The script published in your Google Sheet is version ' + S.backend + ', older than this page (' + NEEDS + '). Bills still save, but without the speed changes. To publish the new script: in Apps Script choose Deploy > Manage deployments, tap the pencil, set Version to New version, then Deploy.';
   S.settings = Object.assign(S.settings, j.settings || {}); S.parties = j.parties || { purchase: {}, order: {} };
   if (!S.parties.purchase) S.parties.purchase = {}; if (!S.parties.order) S.parties.order = {};
   $('demoNote').hidden = !S.demo; setKind(S.kind); drawPages(); drawLog(); show('home');
