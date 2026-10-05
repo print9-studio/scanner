@@ -4,10 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="robots" content="noindex, nofollow">
-<meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-title" content="P9 Scanner">
-<meta name="apple-mobile-web-app-status-bar-style" content="default">
 <meta name="theme-color" content="#1d3f91">
 <meta name="format-detection" content="telephone=no">
 <title>Print9 Scanner</title>
@@ -206,6 +203,8 @@ body.typing .tally{position:static}
         <div class="pages" id="pages"></div>
         <button class="btn main" type="button" id="btnRead" style="margin-top:10px">Read this bill</button>
       </div>
+      <p class="help" id="camHelp">Camera screen black? Take the picture with the iPhone Camera app, then use "Choose photos or a PDF" to pick it.</p>
+      <div class="note" id="standaloneNote" hidden>You opened this from the Home Screen. On some iPhones the camera stays black in that mode. If it does, open the page in Safari instead.</div>
       <button class="btn quiet" type="button" id="btnManual">Type a bill in by hand</button>
     </div>
 
@@ -1548,6 +1547,8 @@ function wire() {
 window.P9Raw = function () { return S.bill ? S.bill.raw : ''; };
 function start() {
   wire();
+  var alone = window.navigator.standalone === true || (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches);
+  $('standaloneNote').hidden = !alone;
   S.url = store.get('p9.url') || ''; S.token = store.get('p9.token') || '';
   prepConnect();
   if (S.url && S.token) {
