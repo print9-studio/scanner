@@ -176,6 +176,7 @@ body.typing .tally{position:static}
       <button class="btn quiet" type="button" id="btnChangeUrl" hidden>Change connection link</button>
       <button class="btn quiet" type="button" id="btnDemo">Try it without signing in</button>
     </div>
+    <p class="help">Page version <span class="pageVer"></span></p>
   </form>
 </section>
 
@@ -341,6 +342,7 @@ body.typing .tally{position:static}
     <div id="setMsg" class="note" hidden></div>
     <button class="btn main" type="button" id="btnSetSave">Save settings</button>
     <button class="btn quiet" type="button" id="btnForgetUrl">Forget the connection link on this device</button>
+    <p class="help" id="verLine"></p>
   </div>
 </section>
 
@@ -624,7 +626,9 @@ body.typing .tally{position:static}
 
   /* ---------- line items ---------- */
   var HEAD = [/\b(description|particulars?|items?|product|goods|details)\b/i, /\b(qty|quantity|qnty)\b/i, /\b(rate|price|mrp)\b/i, /\b(amount|amt|value)\b/i, /\b(hsn|sac)\b/i];
-  var END = /^(sub\s*-?\s*total|total|grand|net\s|taxable|add\s*:|less\s*:|c\.?gst|s\.?gst|i\.?gst|utgst|gst\b|output|input\s|tax\s|round|amount\s+(in|chargeable)|rupees|inr\s|bank|terms|declaration|e\.?\s*&\s*o|authori[sz]ed|thank|continued|page\s|company'?s|note\s*:)/i;
+  var END = /^(sub\s*-?\s*total|total|grand|net\s|taxable|add\s*:|less\s*:|c\.?gst|s\.?gst|i\.?gst|utgst|gst\b|output|input\s|tax\s|round|amount\s+(in|chargeable)|rupees|inr\s|bank|terms|declaration|e\.?\s*&\s*o|authori[sz]ed|thank|company'?s|note\s*:)/i;
+  /* page furniture on bills that run over several pages: skipped, so the item list carries on */
+  var CARRY = /^(\(?\s*continued|\(?\s*contd|to\s+be\s+continued|page\s*(no\.?\s*)?\d|carried\s|brought\s|c\/f\b|b\/f\b|balance\s+[cb]\/?f)/i;
   var CHARGE = /\b(freight|transport(ation)?|cartage|courier|delivery|packing|forwarding|p\s*&\s*f|loading|unloading|handling|postage|lorry|shipping|porter|auto\s*charges?|labour\s*charges?)\b/i;
   var DISCOUNT = /\b(discount|disc\.|rebate)\b|^less\s*:/i;
   var ROUND = /\bround(ed|ing)?\s*-?\s*off\b|\br\.?\s?off\b|\broundoff\b/i;
@@ -710,7 +714,7 @@ body.typing .tally{position:static}
       var hits = 0; for (k = 0; k < HEAD.length; k++) if (HEAD[k].test(lines[i])) hits++;
       if (hits >= 2 && moneyOnLine(lines[i]).length <= 1) { head = i; break; }
     }
-    var items = [], end = lines.length, start = head >= 0 ? head + 1 : 0;
+    var items = [], end = lines.length, start = head >= 0 ? head + 1 : 0, gap = false;
     for (i = start; i < lines.length; i++) {
       var ln = lines[i].trim();
       if (!ln) continue;
@@ -718,7 +722,15 @@ body.typing .tally{position:static}
       var row = parseRow(ln);
       var isCharge = CHARGE.test(bare) || DISCOUNT.test(bare) || ROUND.test(bare);
       if (head >= 0) {
+        if (CARRY.test(bare)) { gap = true; continue; }
         if (END.test(bare) || /amount\s+(in\s+words|chargeable)/i.test(bare) || (isCharge && !(row && row.triple))) { end = i; break; }
+        if (gap) {
+          /* between pages: letterhead and address lines are not items. Carry on at the repeated column header, or at the next clear qty x rate line. */
+          var again = 0; for (k = 0; k < HEAD.length; k++) if (HEAD[k].test(ln)) again++;
+          if (again >= 2 && moneyOnLine(ln).length <= 1) { gap = false; continue; }
+          if (!row || !row.triple) continue;
+          gap = false;
+        }
         if (!row) continue;
         if (row.textOnly) {
           if (items.length && !HEAD.some(function (h) { return h.test(ln); }) && ln.length < 90) items[items.length - 1].desc = (items[items.length - 1].desc + ' ' + row.desc).trim();
@@ -1096,17 +1108,47 @@ var COPY = {
   smallest: { max: 1200, q: 0.45, grey: true }
 };
 function copyChoice() { var v = store.get('p9.copy'); return COPY[v] ? v : 'compact'; }
+function fit(im, max) { var w = im.naturalWidth || im.width, h = im.naturalHeight || im.height, k = Math.min(1, max / Math.max(w, h)); return { w: Math.max(1, Math.round(w * k)), h: Math.max(1, Math.round(h * k)) }; }
+/* Several pages become one PDF, so a bill is one file in Drive and the sheet links to all of it. */
+function pdfFromJpegs(pages) {
+  var enc = function (s) { var u = new Uint8Array(s.length); for (var i = 0; i < s.length; i++) u[i] = s.charCodeAt(i) & 255; return u; };
+  var parts = [], offs = [], pos = 0;
+  function put(x) { var u = typeof x === 'string' ? enc(x) : x; parts.push(u); pos += u.length; }
+  function obj(n, head, stream) { offs[n] = pos; put(n + ' 0 obj\n' + head + '\n'); if (stream) { put('stream\n'); put(stream); put('\nendstream\n'); } put('endobj\n'); }
+  put('%PDF-1.4\n%\xE2\xE3\xCF\xD3\n');
+  var n = pages.length, kids = [];
+  for (var i = 0; i < n; i++) kids.push((3 + i * 3) + ' 0 R');
+  obj(1, '<< /Type /Catalog /Pages 2 0 R >>');
+  obj(2, '<< /Type /Pages /Kids [' + kids.join(' ') + '] /Count ' + n + ' >>');
+  pages.forEach(function (p, ix) {
+    var a = 3 + ix * 3, W = 595, H = Math.round(595 * p.h / p.w * 100) / 100, img = enc(atob(p.b64));
+    var content = 'q ' + W + ' 0 0 ' + H + ' 0 0 cm /Im0 Do Q';
+    obj(a, '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ' + W + ' ' + H + '] /Resources << /XObject << /Im0 ' + (a + 1) + ' 0 R >> >> /Contents ' + (a + 2) + ' 0 R >>');
+    obj(a + 1, '<< /Type /XObject /Subtype /Image /Width ' + p.w + ' /Height ' + p.h + ' /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length ' + img.length + ' >>', img);
+    obj(a + 2, '<< /Length ' + content.length + ' >>', content);
+  });
+  var total = 2 + n * 3, xref = pos, x = 'xref\n0 ' + (total + 1) + '\n0000000000 65535 f \n';
+  for (var k = 1; k <= total; k++) x += ('0000000000' + offs[k]).slice(-10) + ' 00000 n \n';
+  put(x + 'trailer\n<< /Size ' + (total + 1) + ' /Root 1 0 R >>\nstartxref\n' + xref + '\n%%EOF\n');
+  var out = new Uint8Array(pos), at = 0;
+  parts.forEach(function (u) { out.set(u, at); at += u.length; });
+  return b64FromBuffer(out.buffer);
+}
 function archive(b) {
   var choice = copyChoice(), c = COPY[choice];
-  var isPdf = b.files.length && b.files[0].mime === 'application/pdf';
-  if (!b.pages.length || choice === 'clear' || b.digital) return Promise.resolve(b);
-  /* a scanned PDF longer than the pages prepared here is kept whole, so no page is dropped */
-  if (isPdf && (b.pdfPages || 0) > b.pages.length) return Promise.resolve(b);
+  var wasPdf = b.files.length && b.files[0].mime === 'application/pdf';
+  if (!b.pages.length || b.digital) return Promise.resolve(b);
+  /* an uploaded scan is kept as it came when asked for Clear, or when it is longer than the pages prepared here */
+  if (wasPdf && (choice === 'clear' || (b.pdfPages || 0) > b.pages.length)) return Promise.resolve(b);
+  if (!wasPdf && choice === 'clear' && b.pages.length === 1) return Promise.resolve(b);
   var out = [], chain = Promise.resolve();
-  b.pages.forEach(function (pg, i) {
-    chain = chain.then(function () { return loadImage(pg.dataUrl); }).then(function (im) { out.push({ name: 'page-' + (i + 1) + '.jpg', mime: 'image/jpeg', b64: b64FromDataUrl(scaled(im, c.max, c.q, c.grey)) }); });
+  b.pages.forEach(function (pg) {
+    chain = chain.then(function () { return loadImage(pg.dataUrl); }).then(function (im) { var d = fit(im, c.max); out.push({ b64: b64FromDataUrl(scaled(im, c.max, c.q, c.grey)), w: d.w, h: d.h }); });
   });
-  return chain.then(function () { b.files = out; return b; }, function () { return b; });
+  return chain.then(function () {
+    b.files = out.length > 1 ? [{ name: 'bill.pdf', mime: 'application/pdf', b64: pdfFromJpegs(out) }] : [{ name: 'page-1.jpg', mime: 'image/jpeg', b64: out[0].b64 }];
+    return b;
+  }, function () { return b; });
 }
 function lighter(dataUrl) { return loadImage(dataUrl).then(function (im) { return scaled(im, UP.max, UP.q); }); }
 function upB64(pg) { return b64FromDataUrl(pg.up || pg.dataUrl); }
@@ -1232,7 +1274,7 @@ function readBill(input, kind, hint, step) {
       return pdfLines(o.pdf, 8);
     }).then(function (lines) {
       ctx.lines = lines; ctx.digital = lines.join('').replace(/\s/g, '').length >= 40;
-      var chain = Promise.resolve(), n = Math.min(ctx.pdf.numPages, 4);
+      var chain = Promise.resolve(), n = Math.min(ctx.pdf.numPages, 6);
       for (var i = 1; i <= n; i++) (function (no) { chain = chain.then(function () { step('Preparing page ' + no, 0.1 + 0.1 * no / n); return pdfPageImage(ctx.pdf, no, ctx.digital ? 1300 : 2000); }).then(function (d) { ctx.pages.push({ dataUrl: d, name: 'page-' + no + '.jpg' }); }); })(i);
       return chain;
     }).then(function () {
@@ -1421,7 +1463,7 @@ function fileLater(job, tryNo) {
 /* ---------- home ---------- */
 function drawPages() {
   $('pagesBox').hidden = !S.pages.length;
-  $('pagesHint').textContent = S.pages.length > 1 ? S.pages.length + ' pages of this bill. Add more, or read it.' : 'One page. Add another page if the bill continues, or read it.';
+  $('pagesHint').textContent = S.pages.length > 1 ? S.pages.length + ' pages of this one bill, in order. Add more, or read it.' : 'One page. Add another page if the bill continues, or read it.';
   $('pages').innerHTML = S.pages.map(function (pg, i) { return '<div class="pg"><img alt="Page ' + (i + 1) + '" src="' + pg.dataUrl + '"><button type="button" data-rm="' + i + '" aria-label="Remove page ' + (i + 1) + '">×</button></div>'; }).join('');
 }
 function setKind(k) {
@@ -1441,9 +1483,12 @@ function addFiles(list) {
     S.pages = []; drawPages();
     return runPurchase({ file: pdf });
   }
+  var room = 6 - S.pages.length;
+  if (room <= 0 || files.length > room) toast('A bill can have up to 6 pages here.' + (room > 0 ? ' The first ' + room + ' were added.' : ''), 5000);
+  if (room <= 0) return;
   busy('Preparing the photo', 0.3);
   var chain = Promise.resolve();
-  files.slice(0, 8).forEach(function (f) { chain = chain.then(function () { return imageToPage(f); }).then(function (pg) { S.pages.push(pg); }); });
+  files.slice(0, room).forEach(function (f) { chain = chain.then(function () { return imageToPage(f); }).then(function (pg) { S.pages.push(pg); }); });
   chain.then(function () { idle(); drawPages(); $('btnRead').scrollIntoView({ block: 'center' }); }).catch(function (e) { idle(); drawPages(); toast(e.message, 5000); });
 }
 function runPurchase(input) {
@@ -1523,6 +1568,7 @@ function openSettings() {
   $('sReaderLocal').checked = !s.useGemini; $('sReaderGem').checked = !!s.useGemini;
   $('sKey').value = ''; $('keyTag').textContent = s.hasGeminiKey ? 'a key is saved' : 'no key saved'; $('keyTag').className = 'pill ' + (s.hasGeminiKey ? 'ok' : 'plain');
   $('sScans').checked = !!s.saveScans; $('sAuto').checked = !!s.autoOrders; $('sFast').checked = !!s.fastGemini; $('sCopy').value = copyChoice(); $('setMsg').hidden = true;
+  $('verLine').textContent = 'Page version ' + PAGE + '. Script version ' + (S.demo ? 'none (trial mode)' : (S.backend || 'unknown')) + '.';
   show('settings');
 }
 function setMsg(text, bad) { var m = $('setMsg'); m.hidden = false; m.className = 'note' + (bad ? ' bad' : ' plain'); m.textContent = text; }
@@ -1543,6 +1589,7 @@ function saveSettings() {
 function prepConnect() {
   $('urlBlock').hidden = !!S.url; $('btnChangeUrl').hidden = !S.url; $('inUrl').value = S.url || ''; $('inPass').value = ''; $('connectErr').hidden = true;
 }
+var PAGE = '1.7';
 var NEEDS = '1.3.0';
 function older(a, b) { var x = String(a || '0').split('.'), y = String(b).split('.'); for (var i = 0; i < 3; i++) { var d = (Number(x[i]) || 0) - (Number(y[i]) || 0); if (d) return d < 0; } return false; }
 function enter(j) {
@@ -1660,6 +1707,7 @@ function wire() {
 window.P9Raw = function () { return S.bill ? S.bill.raw : ''; };
 function start() {
   wire();
+  Array.prototype.forEach.call(document.querySelectorAll('.pageVer'), function (el) { el.textContent = PAGE; });
   var alone = window.navigator.standalone === true || (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches);
   $('standaloneNote').hidden = !alone;
   S.url = store.get('p9.url') || ''; S.token = store.get('p9.token') || '';
