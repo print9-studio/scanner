@@ -993,15 +993,24 @@ function demoApi(action, data) {
     }, 250);
   });
 }
+/* Google answered with a web page, not data. Say what that page says, so the cause is visible. */
+function explain(html, status) {
+  var plain = String(html || '').replace(/<(script|style)[\s\S]*?<\/\1>/gi, ' ').replace(/<[^>]+>/g, ' ').replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/\s+/g, ' ').trim();
+  if (/accounts\.google\.com|ServiceLogin|Sign in to continue|You need access|need permission/i.test(html)) return 'Google asked for a sign-in instead of answering. In Apps Script, open Deploy > Manage deployments and set "Who has access" to Anyone.';
+  if (/Script function not found/i.test(plain)) return 'The script in your Google Sheet is incomplete (' + plain.slice(0, 80) + '). Paste the whole of Code.gs again, save, and publish a new version.';
+  if (/unable to open the file|Service unavailable|try again later|temporarily/i.test(plain)) return 'Google\'s script service did not respond properly just now. Wait a minute and try again. Google said: "' + plain.slice(0, 120) + '"';
+  if (/Authorization is required|authoriz/i.test(plain)) return 'The script needs your permission again. In the Google Sheet, run Print9 Scanner > 1. Set up tabs and approve the request. Google said: "' + plain.slice(0, 120) + '"';
+  return 'The Google Sheet script answered with an error page' + (status && status !== 200 ? ' (code ' + status + ')' : '') + (plain ? ': "' + plain.slice(0, 220) + '"' : '. Check the connection link and that access is set to Anyone.');
+}
 function api(action, data) {
   if (S.demo) return demoApi(action, data || {}).then(function (j) { if (!j.ok) throw new Error(j.error); return j; });
   var body = JSON.stringify(Object.assign({ action: action, token: S.token }, data || {}));
   return fetch(S.url, { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: body, redirect: 'follow' })
     .catch(function () { throw new Error('Could not reach your Google Sheet. Check the internet connection and try again.'); })
-    .then(function (r) { return r.text(); })
-    .then(function (txt) {
-      var j;
-      try { j = JSON.parse(txt); } catch (e) { throw new Error('The connection link did not answer as expected. Check the link, and that the web app is deployed with access set to Anyone.'); }
+    .then(function (r) { return r.text().then(function (txt) { return { txt: txt, status: r.status }; }); })
+    .then(function (res) {
+      var j, txt = res.txt;
+      try { j = JSON.parse(txt); } catch (e) { throw new Error(explain(txt, res.status)); }
       if (j.auth) { S.token = ''; store.del('p9.token'); show('connect'); prepConnect(); throw new Error(j.error || 'Signed out. Sign in again.'); }
       if (!j.ok) throw new Error(j.error || 'Something went wrong.');
       return j;
