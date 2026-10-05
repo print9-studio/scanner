@@ -328,6 +328,14 @@ body.typing .tally{position:static}
 
     <h3>Saving</h3>
     <label class="switch"><input type="checkbox" id="sScans"><span>File a copy of every bill and invoice in Google Drive<small>One folder per month, with Purchase and Invoice folders inside. The sheet row links to the file.</small></span></label>
+    <label class="f">Size of the copy kept in Drive
+      <select id="sCopy">
+        <option value="clear">Clear: colour, largest files</option>
+        <option value="compact">Compact: black and white, smaller files</option>
+        <option value="smallest">Smallest: black and white, fine print may blur</option>
+      </select>
+    </label>
+    <p class="help">Applies to photos and scans from now on, on this phone. Bills are still read from the sharp picture. Digital PDFs are filed unchanged.</p>
     <label class="switch"><input type="checkbox" id="sAuto"><span>Save order invoices without asking when every check passes<small>Turn off to look at each one first.</small></span></label>
 
     <div id="setMsg" class="note" hidden></div>
@@ -1067,12 +1075,38 @@ function imageToPage(file) {
 }
 /* what leaves the phone: long edge 1800 px at medium JPEG quality keeps small print legible at a fraction of the camera file */
 var UP = { max: 1800, q: 0.72 };
-function scaled(im, max, q) {
+function scaled(im, max, q, grey) {
   var w = im.naturalWidth || im.width, h = im.naturalHeight || im.height, k = Math.min(1, max / Math.max(w, h));
   var c = document.createElement('canvas'); c.width = Math.max(1, Math.round(w * k)); c.height = Math.max(1, Math.round(h * k));
   var g = c.getContext('2d'); g.fillStyle = '#fff'; g.fillRect(0, 0, c.width, c.height); g.drawImage(im, 0, 0, c.width, c.height);
+  if (grey) {
+    try {
+      var px = g.getImageData(0, 0, c.width, c.height), d = px.data;
+      for (var i = 0; i < d.length; i += 4) { var y = (d[i] * 77 + d[i + 1] * 150 + d[i + 2] * 29) >> 8; d[i] = d[i + 1] = d[i + 2] = y; }
+      g.putImageData(px, 0, 0);
+    } catch (e) { /* keep colour if the browser refuses */ }
+  }
   var data = c.toDataURL('image/jpeg', q); c.width = c.height = 1;
   return data;
+}
+/* The copy kept in Drive. Reading always uses the sharp picture; only the filed copy is made smaller. */
+var COPY = {
+  clear: { max: 1800, q: 0.72, grey: false },
+  compact: { max: 1500, q: 0.55, grey: true },
+  smallest: { max: 1200, q: 0.45, grey: true }
+};
+function copyChoice() { var v = store.get('p9.copy'); return COPY[v] ? v : 'compact'; }
+function archive(b) {
+  var choice = copyChoice(), c = COPY[choice];
+  var isPdf = b.files.length && b.files[0].mime === 'application/pdf';
+  if (!b.pages.length || choice === 'clear' || b.digital) return Promise.resolve(b);
+  /* a scanned PDF longer than the pages prepared here is kept whole, so no page is dropped */
+  if (isPdf && (b.pdfPages || 0) > b.pages.length) return Promise.resolve(b);
+  var out = [], chain = Promise.resolve();
+  b.pages.forEach(function (pg, i) {
+    chain = chain.then(function () { return loadImage(pg.dataUrl); }).then(function (im) { out.push({ name: 'page-' + (i + 1) + '.jpg', mime: 'image/jpeg', b64: b64FromDataUrl(scaled(im, c.max, c.q, c.grey)) }); });
+  });
+  return chain.then(function () { b.files = out; return b; }, function () { return b; });
 }
 function lighter(dataUrl) { return loadImage(dataUrl).then(function (im) { return scaled(im, UP.max, UP.q); }); }
 function upB64(pg) { return b64FromDataUrl(pg.up || pg.dataUrl); }
@@ -1237,7 +1271,7 @@ function readBill(input, kind, hint, step) {
     }
     return localRead();
   }).then(function (b) {
-    b.pages = ctx.pages; b.files = ctx.files; b.digital = ctx.digital; b.readMs = Date.now() - t0; b.raw = (ctx.raw || []).join('\n');
+    b.pages = ctx.pages; b.files = ctx.files; b.digital = ctx.digital; b.pdfPages = ctx.pdf ? ctx.pdf.numPages : 0; b.readMs = Date.now() - t0; b.raw = (ctx.raw || []).join('\n');
     if (b.gstin && S.parties[kind][b.gstin]) { b.party = S.parties[kind][b.gstin]; b.partySure = true; }
     return b;
   });
@@ -1353,10 +1387,11 @@ function saveCurrent(force) {
   if (!force && rv.state !== 'ok') go = ask(rv.state === 'off' ? 'Rows and the bill total differ by ₹' + money(Math.abs(rv.c.diff)) + '. Save anyway? The entry will be marked CHECK in the sheet.' : 'No bill total was entered. Save anyway? The entry will be marked CHECK in the sheet.', 'Save anyway', 'Go back');
   go.then(function (yes) {
     if (!yes) return;
-    busy('Saving to ' + TAB[b.kind], 0.6);
-    var pay = payload(b, rv), scans = [];
-    if (!older(S.backend, '1.2.0')) { scans = pay.files; pay.files = []; }
-    return api('save', { kind: b.kind, bills: [pay], force: !!force }).then(function (j) {
+    var scans = [], filingOn = S.settings.saveScans && b.files.length;
+    busy(filingOn ? 'Saving to ' + TAB[b.kind] + ' and filing the scan' : 'Saving to ' + TAB[b.kind], 0.6);
+    return (filingOn ? archive(b) : Promise.resolve(b)).then(function () {
+      return api('save', { kind: b.kind, bills: [payload(b, rv)], force: !!force });
+    }).then(function (j) {
       idle();
       var r = j.results[0];
       if (r.status === 'duplicate') {
@@ -1366,7 +1401,6 @@ function saveCurrent(force) {
       var g = String(b.gstin || '').toUpperCase(); if (E.gstinValid(g)) S.parties[b.kind][g] = String(b.party).trim();
       logSaved(b, rv.c);
       toast('Saved to ' + TAB[b.kind] + ': ' + r.rows + (r.rows === 1 ? ' row' : ' rows'));
-      if (scans.length && r.entry) fileLater({ kind: b.kind, entry: r.entry, files: scans, year: pay.year, month: pay.month, party: pay.party, billNo: pay.billNo }, 1);
       if (S.ctx && S.ctx.from === 'batch') { var it = S.batch[S.ctx.index]; if (it) { it.status = 'added'; it.detail = describe(b, rv.c); it.bill = null; } S.bill = null; drawBatch(); show('batch'); }
       else { S.pages = []; S.pdfFile = null; S.bill = null; drawPages(); show('home'); }
     });
@@ -1468,7 +1502,7 @@ function runBatch() {
       var rv = review(b.month === 'auto' ? Object.assign({}, b, { month: S.month }) : b);
       it.detail = describe(b, rv.c);
       var clean = !rv.block.length && rv.state === 'ok' && b.partySure && !rv.warn.length && b.digital && !b.notes.length;
-      if (clean && S.settings.autoOrders) { pending.push({ it: it, pay: payload(b, rv) }); it.status = 'saving'; }
+      if (clean && S.settings.autoOrders) { pending.push({ it: it, pay: payload(b, rv) }); it.status = 'saving'; } /* digital PDFs are filed as they are */
       else {
         it.status = 'waiting'; it.bill = b;
         var why = rv.block[0] || (rv.state === 'off' ? 'Rows and total differ by ₹' + money(Math.abs(rv.c.diff)) + '.' : rv.state === 'nototal' ? 'Total not found.' : (!b.digital ? 'Read from a picture, so it needs your eye.' : (rv.warn[0] || b.notes[0] || (!S.settings.autoOrders ? 'Waiting for your check.' : 'Customer name needs a look.'))));
@@ -1488,7 +1522,7 @@ function openSettings() {
   $('sGstin').value = s.myGstin || ''; $('sName').value = s.myName || '';
   $('sReaderLocal').checked = !s.useGemini; $('sReaderGem').checked = !!s.useGemini;
   $('sKey').value = ''; $('keyTag').textContent = s.hasGeminiKey ? 'a key is saved' : 'no key saved'; $('keyTag').className = 'pill ' + (s.hasGeminiKey ? 'ok' : 'plain');
-  $('sScans').checked = !!s.saveScans; $('sAuto').checked = !!s.autoOrders; $('sFast').checked = !!s.fastGemini; $('setMsg').hidden = true;
+  $('sScans').checked = !!s.saveScans; $('sAuto').checked = !!s.autoOrders; $('sFast').checked = !!s.fastGemini; $('sCopy').value = copyChoice(); $('setMsg').hidden = true;
   show('settings');
 }
 function setMsg(text, bad) { var m = $('setMsg'); m.hidden = false; m.className = 'note' + (bad ? ' bad' : ' plain'); m.textContent = text; }
@@ -1499,6 +1533,7 @@ function saveSettings() {
   if (useG && !key && !S.settings.hasGeminiKey) return setMsg('Paste a Gemini API key to use Gemini, or choose the built-in reader.', true);
   var data = { settings: { myGstin: g, myName: $('sName').value.trim(), useGemini: useG, saveScans: $('sScans').checked, autoOrders: $('sAuto').checked, fastGemini: $('sFast').checked } };
   if (key) data.geminiKey = key;
+  store.set('p9.copy', $('sCopy').value);
   busy('Saving settings', 0.5);
   api('saveSettings', data).then(function (j) { idle(); S.settings = j.settings; if (S.demo && key) S.settings.hasGeminiKey = true; toast('Settings saved'); show(S.back === 'review' && S.bill ? 'review' : (S.back === 'batch' ? 'batch' : 'home')); })
     .catch(function (e) { idle(); setMsg(e.message, true); });
