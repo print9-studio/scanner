@@ -1002,19 +1002,45 @@ function explain(html, status) {
   if (/Authorization is required|authoriz/i.test(plain)) return 'The script needs your permission again. In the Google Sheet, run Print9 Scanner > 1. Set up tabs and approve the request. Google said: "' + plain.slice(0, 120) + '"';
   return 'The Google Sheet script answered with an error page' + (status && status !== 200 ? ' (code ' + status + ')' : '') + (plain ? ': "' + plain.slice(0, 220) + '"' : '. Check the connection link and that access is set to Anyone.');
 }
-function api(action, data) {
-  if (S.demo) return demoApi(action, data || {}).then(function (j) { if (!j.ok) throw new Error(j.error); return j; });
-  var body = JSON.stringify(Object.assign({ action: action, token: S.token }, data || {}));
+function uid() { return Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10) + Math.random().toString(36).slice(2, 6); }
+function wait(ms) { return new Promise(function (res) { setTimeout(res, ms); }); }
+/* One request to the Google Sheet script. Fails with err.retry = true when the failure is the passing kind. */
+function once(body) {
   return fetch(S.url, { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: body, redirect: 'follow' })
-    .catch(function () { throw new Error('Could not reach your Google Sheet. Check the internet connection and try again.'); })
+    .catch(function () { var e = new Error('Could not reach your Google Sheet. Check the internet connection and try again.'); e.retry = true; throw e; })
     .then(function (r) { return r.text().then(function (txt) { return { txt: txt, status: r.status }; }); })
     .then(function (res) {
-      var j, txt = res.txt;
-      try { j = JSON.parse(txt); } catch (e) { throw new Error(explain(txt, res.status)); }
-      if (j.auth) { S.token = ''; store.del('p9.token'); show('connect'); prepConnect(); throw new Error(j.error || 'Signed out. Sign in again.'); }
-      if (!j.ok) throw new Error(j.error || 'Something went wrong.');
-      return j;
+      try { return JSON.parse(res.txt); } catch (x) {
+        var e = new Error(explain(res.txt, res.status));
+        e.retry = !/sign-in|incomplete|permission again/i.test(e.message);
+        throw e;
+      }
     });
+}
+/*
+ * Google's free web-app service now and then answers with an error page instead of running the script.
+ * Every request is therefore tried up to three times. Saves carry an id, and the script hands back its
+ * first answer when it sees the id again, so a repeat can never write a bill twice.
+ */
+function api(action, data) {
+  if (S.demo) return demoApi(action, data || {}).then(function (j) { if (!j.ok) throw new Error(j.error); return j; });
+  data = Object.assign({}, data || {});
+  var writes = action === 'save' || action === 'attach';
+  if (writes && !data.rid) data.rid = uid();
+  var tries = (action === 'login' || action === 'logout') ? 1 : (writes && older(S.backend, '1.3.0') ? 1 : 3);
+  var body = JSON.stringify(Object.assign({ action: action, token: S.token }, data));
+  function go(n) {
+    return once(body).catch(function (e) {
+      if (!e.retry || n >= tries) throw e;
+      if (!$('busy').hidden) $('busyText').textContent = 'Google did not answer. Trying again (' + (n + 1) + ' of ' + tries + ')';
+      return wait(n === 1 ? 1500 : 4000).then(function () { return go(n + 1); });
+    });
+  }
+  return go(1).then(function (j) {
+    if (j.auth) { S.token = ''; store.del('p9.token'); show('connect'); prepConnect(); throw new Error(j.error || 'Signed out. Sign in again.'); }
+    if (!j.ok) throw new Error(j.error || 'Something went wrong.');
+    return j;
+  });
 }
 
 /* ---------- loading the PDF and photo-reading libraries on demand ---------- */
@@ -1329,7 +1355,7 @@ function saveCurrent(force) {
     if (!yes) return;
     busy('Saving to ' + TAB[b.kind], 0.6);
     var pay = payload(b, rv), scans = [];
-    if (!S.oldBackend) { scans = pay.files; pay.files = []; }
+    if (!older(S.backend, '1.2.0')) { scans = pay.files; pay.files = []; }
     return api('save', { kind: b.kind, bills: [pay], force: !!force }).then(function (j) {
       idle();
       var r = j.results[0];
@@ -1353,7 +1379,6 @@ function drawFiling() { var n = $('filingNote'); n.hidden = !filing; n.textConte
 function fileLater(job, tryNo) {
   if (tryNo === 1) { filing++; drawFiling(); }
   api('attach', job).then(function () { filing--; drawFiling(); }).catch(function (e) {
-    if (tryNo < 2 && S.token) return setTimeout(function () { fileLater(job, tryNo + 1); }, 4000);
     filing--; drawFiling();
     toast('Bill ' + job.billNo + ' is saved in the sheet, but its scan was not filed in Drive: ' + (/unknown request/i.test(e.message) ? 'the new script version is not published yet.' : e.message), 9000);
   });
@@ -1483,13 +1508,13 @@ function saveSettings() {
 function prepConnect() {
   $('urlBlock').hidden = !!S.url; $('btnChangeUrl').hidden = !S.url; $('inUrl').value = S.url || ''; $('inPass').value = ''; $('connectErr').hidden = true;
 }
-var NEEDS = '1.2.0';
+var NEEDS = '1.3.0';
 function older(a, b) { var x = String(a || '0').split('.'), y = String(b).split('.'); for (var i = 0; i < 3; i++) { var d = (Number(x[i]) || 0) - (Number(y[i]) || 0); if (d) return d < 0; } return false; }
 function enter(j) {
   S.backend = S.demo ? NEEDS : (j.version || '1.0.0');
   S.oldBackend = older(S.backend, NEEDS);
   $('oldBackend').hidden = !S.oldBackend;
-  $('oldBackend').textContent = 'The script published in your Google Sheet is version ' + S.backend + ', older than this page (' + NEEDS + '). Bills still save, but without the speed changes. To publish the new script: in Apps Script choose Deploy > Manage deployments, tap the pencil, set Version to New version, then Deploy.';
+  $('oldBackend').textContent = 'The script published in your Google Sheet is version ' + S.backend + ', older than this page (' + NEEDS + '). Bills still save, but without the newer speed and retry changes. To publish the new script: in Apps Script choose Deploy > Manage deployments, tap the pencil, set Version to New version, then Deploy.';
   S.settings = Object.assign(S.settings, j.settings || {}); S.parties = j.parties || { purchase: {}, order: {} };
   if (!S.parties.purchase) S.parties.purchase = {}; if (!S.parties.order) S.parties.order = {};
   $('demoNote').hidden = !S.demo; setKind(S.kind); drawPages(); drawLog(); show('home');
