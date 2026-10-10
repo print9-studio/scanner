@@ -191,6 +191,7 @@ body.typing .tally{position:static}
       <button type="button" data-kind="purchase" aria-pressed="true">Purchase bill</button>
       <button type="button" data-kind="order" aria-pressed="false">Order invoice</button>
     </div>
+    <label class="f">Business<select id="selBiz"></select></label>
     <div class="pair">
       <label class="f">Month<select id="selMonth"></select></label>
       <label class="f">Year<select id="selYear"></select></label>
@@ -230,6 +231,7 @@ body.typing .tally{position:static}
   <h2 id="revTitle">Check the bill</h2>
   <p class="sub" id="revSub"></p>
   <div class="stack" style="margin-top:12px">
+    <label class="f">Business<select id="rBiz"></select></label>
     <div id="revNotes" class="note" hidden></div>
     <div id="viewerBox" hidden>
       <div class="viewer" id="viewer"></div>
@@ -289,7 +291,7 @@ body.typing .tally{position:static}
 
 <!-- batch -->
 <section id="v-batch" hidden>
-  <h2>Order invoices</h2>
+  <h2 id="batchTitle">Order invoices</h2>
   <p class="sub" id="batchSub"></p>
   <div class="counts num" style="margin:14px 0">
     <div><b id="cAdded">0</b><span>Added</span></div>
@@ -959,8 +961,18 @@ var S = {
   month: now.getMonth() + 1, year: now.getFullYear(), orderMonth: 'auto',
   settings: { myGstin: '', myName: 'Print9', useGemini: false, saveScans: true, autoOrders: true, hasGeminiKey: false },
   parties: { purchase: {}, order: {} },
-  pages: [], pdfFile: null, bill: null, ctx: null, batch: [], log: [], back: 'home'
+  pages: [], pdfFile: null, bill: null, ctx: null, batch: [], log: [], back: 'home', biz: ''
 };
+/* Both businesses trade under the one GST registration. Every bill and invoice is marked with one of them. */
+var BUSINESSES = ['Print9', 'Happiness Factory'];
+function bizOk(v) { return BUSINESSES.indexOf(v) >= 0; }
+function bizOpts() { return [['', 'Choose the business']].concat(BUSINESSES.map(function (x) { return [x, x]; })); }
+function needBiz() {
+  if (bizOk(S.biz)) return true;
+  toast('Choose the business first: ' + BUSINESSES.join(' or ') + '.', 5000);
+  try { $('selBiz').focus(); } catch (e) {}
+  return false;
+}
 
 /* ---------- small helpers ---------- */
 function $(id) { return document.getElementById(id); }
@@ -1224,7 +1236,7 @@ function ocr(dataUrl, onProgress) {
 /* ---------- reading one bill ---------- */
 function blankBill(kind) {
   return { kind: kind, party: '', partySure: true, gstin: '', billNo: '', date: '', inter: false, month: S.month, year: S.year,
-    rows: [{ type: 'Item', desc: '', hsn: '', qty: null, rate: null, taxable: null, gst: null }], total: null, notes: [], readBy: 'Typed', pages: [], files: [] };
+    rows: [{ type: 'Item', desc: '', hsn: '', qty: null, rate: null, taxable: null, gst: null }], total: null, notes: [], readBy: 'Typed', pages: [], files: [], business: S.biz };
 }
 function fromEngine(p, kind) {
   var b = blankBill(kind);
@@ -1262,7 +1274,7 @@ function fromGemini(d, kind) {
   return b;
 }
 function geminiOn() { return !!(S.settings.useGemini && S.settings.hasGeminiKey && !S.demo); }
-function askGemini(kind, files) { return api('aiRead', { kind: kind, files: files }).then(function (j) { var gb = fromGemini(j.data || {}, kind); gb.aiMs = j.ms || 0; return gb; }); }
+function askGemini(kind, files, biz) { return api('aiRead', { kind: kind, files: files, business: biz || '' }).then(function (j) { var gb = fromGemini(j.data || {}, kind); gb.aiMs = j.ms || 0; return gb; }); }
 function geminiBusy(e) { return /quota|rate.?limit|exhaust|\b429\b|overload|unavailable|\b503\b/i.test(String(e && e.message)); }
 function niceDate(iso) { var m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(iso || '')); return m ? Number(m[3]) + ' ' + MONTHS[Number(m[2]) - 1] + ' ' + m[1] : String(iso || ''); }
 function flatText(s) { return String(s == null ? '' : s).toUpperCase().replace(/[^0-9A-Z]/g, ''); }
@@ -1300,10 +1312,10 @@ function confirmWithText(b, lines) {
 }
 var AI_WAIT = 20000;
 /* Gemini's free quota allows only so many reads a minute. When it says it is at its limit, wait and ask again, twice at most. */
-function askPatiently(files, step) {
+function askPatiently(files, step, biz) {
   var waits = S.aiTired ? [] : [AI_WAIT, AI_WAIT * 2];
   function go(i) {
-    return askGemini('order', files).then(function (gb) { S.aiTired = false; return gb; }, function (e) {
+    return askGemini('order', files, biz).then(function (gb) { S.aiTired = false; return gb; }, function (e) {
       if (!geminiBusy(e)) throw e;
       if (i >= waits.length) { S.aiTired = true; throw e; }
       step('Gemini is at its limit. Trying again in ' + Math.round(waits[i] / 1000) + ' seconds', 0.5);
@@ -1317,12 +1329,12 @@ function readOrderWithGemini(ctx, step) {
   var pics = ctx.aiFiles.slice(0, 6);
   var whole = ctx.digital && pdfToAi() && ctx.files.length && ctx.files[0].mime === 'application/pdf' && ctx.files[0].b64.length <= 5600000 ? [ctx.files[0]] : null;
   var first = whole || pics;
-  return askPatiently(first, step).catch(function (e) {
+  return askPatiently(first, step, ctx.biz).catch(function (e) {
     /* if the PDF itself did not go through, send pictures of its pages; if Gemini refused the format, keep doing that for a week */
     if (!whole || !pics.length || geminiBusy(e)) throw e;
     step('Sending page pictures to Gemini', 0.6);
     var refused = /mime|unsupported|pdf|document|invalid/i.test(String(e && e.message));
-    return askGemini('order', pics).then(function (gb) { if (refused) store.set('p9.noPdfAi', String(Date.now())); return gb; });
+    return askGemini('order', pics, ctx.biz).then(function (gb) { if (refused) store.set('p9.noPdfAi', String(Date.now())); return gb; });
   }).then(function (gb) {
     if (ctx.digital) {
       ctx.raw = ctx.lines;
@@ -1333,10 +1345,16 @@ function readOrderWithGemini(ctx, step) {
   });
 }
 /* input: { pages:[{dataUrl,name}] } or { file: File(pdf) } */
-function readBill(input, kind, hint, step) {
+function businessNamed(b, lines) {
+  var flat = flatText(lines.join(' ')), mine = flatText(b.business);
+  var other = BUSINESSES.filter(function (x) { return x !== b.business && flat.indexOf(flatText(x)) >= 0; })[0];
+  if (other && mine && flat.indexOf(mine) < 0) b.notes.push('This PDF names ' + other + ', not ' + b.business + '. Check the business chosen.');
+}
+function readBill(input, kind, hint, step, biz) {
   step = step || function () {};
-  var ctx = { lines: [], pages: [], files: [], aiFiles: [], digital: false }, t0 = Date.now();
-  var opts = { kind: kind, myGstin: S.settings.myGstin, myName: S.settings.myName, hint: hint, parties: S.parties[kind] };
+  biz = bizOk(biz) ? biz : S.biz;
+  var ctx = { lines: [], pages: [], files: [], aiFiles: [], digital: false, biz: biz }, t0 = Date.now();
+  var opts = { kind: kind, myGstin: S.settings.myGstin, myName: biz || S.settings.myName, hint: hint, parties: S.parties[kind] };
   var p;
   if (input.file) {
     step('Opening the PDF', 0.05);
@@ -1392,11 +1410,13 @@ function readBill(input, kind, hint, step) {
     }
     if (geminiOn()) {
       step('Sending to Gemini', 0.4);
-      return askGemini(kind, ctx.aiFiles.slice(0, 6))
+      return askGemini(kind, ctx.aiFiles.slice(0, 6), ctx.biz)
         .catch(function (e) { toast('Gemini could not read it (' + e.message + '). Using the built-in reader.', 6000); return localRead(); });
     }
     return localRead();
   }).then(function (b) {
+    b.business = biz;
+    if (ctx.digital) businessNamed(b, ctx.lines);
     b.pages = ctx.pages; b.files = ctx.files; b.digital = ctx.digital; b.pdfPages = ctx.pdf ? ctx.pdf.numPages : 0; b.readMs = Date.now() - t0; b.raw = (ctx.raw || []).join('\n');
     if (b.gstin && S.parties[kind][b.gstin]) { b.party = S.parties[kind][b.gstin]; b.partySure = true; }
     return b;
@@ -1408,6 +1428,7 @@ function signedRows(b) { return b.rows.map(function (r) { var t = toNum(r.taxabl
 function figures(b) { return E.compute({ inter: b.inter, rows: signedRows(b), total: toNum(b.total) }); }
 function review(b) {
   var c = figures(b), block = [], warn = [], who = b.kind === 'order' ? 'Customer' : 'Supplier';
+  if (!bizOk(b.business)) block.push('Choose the business.');
   if (!String(b.party || '').trim()) block.push(who + ' name is empty.');
   if (!String(b.billNo || '').trim()) block.push('Bill number is empty.');
   if (!/^\d{4}-\d{2}-\d{2}$/.test(b.date || '')) block.push('Bill date is empty.');
@@ -1482,6 +1503,7 @@ function openReview(b, ctx) {
   $('btnAddCharge').textContent = order ? 'Add delivery' : 'Add transport';
   var names = {}; Object.keys(S.parties[b.kind]).forEach(function (k) { names[S.parties[b.kind][k]] = 1; });
   $('partyList').innerHTML = Object.keys(names).sort().map(function (n) { return '<option value="' + esc(n) + '">'; }).join('');
+  $('rBiz').value = bizOk(b.business) ? b.business : '';
   $('rParty').value = b.party || ''; $('rGstin').value = b.gstin || ''; $('rBillNo').value = b.billNo || ''; $('rDate').value = b.date || '';
   if (b.month === 'auto') { b.month = b.date ? Number(b.date.slice(5, 7)) : S.month; b.year = b.date ? Number(b.date.slice(0, 4)) : S.year; }
   fillSelect($('rMonth'), monthOpts(false), b.month); fillSelect($('rYear'), yearOpts(), b.year);
@@ -1502,7 +1524,7 @@ function payload(b, rv) {
   else if (g && !E.gstinValid(g)) check = 'CHECK: GSTIN check digit fails';
   return { month: Number(b.month), year: Number(b.year), date: b.date, billNo: String(b.billNo).trim(), party: String(b.party).trim(), gstin: g,
     state: E.gstinValid(g) ? (E.STATES[g.slice(0, 2)] || '') : '', inter: !!b.inter, rows: c.rows.filter(function (r) { return r.taxable || r.desc; }),
-    roundOff: c.roundOff, total: c.total == null ? c.written : c.total, check: check, readBy: b.readBy,
+    roundOff: c.roundOff, total: c.total == null ? c.written : c.total, check: check, readBy: b.readBy, business: b.business,
     files: S.settings.saveScans ? b.files : [] };
 }
 function logSaved(b, c) { S.log.unshift({ label: (b.kind === 'order' ? 'Invoice ' : 'Purchase ') + b.billNo + ', ' + b.party, amt: c.written }); drawLog(); }
@@ -1522,7 +1544,8 @@ function saveCurrent(force) {
       idle();
       var r = j.results[0];
       if (r.status === 'duplicate') {
-        return ask('This bill is already in the sheet: same ' + (b.kind === 'order' ? 'invoice number' : 'supplier and bill number') + '. Add it again?', 'Add again', 'Do not add').then(function (y) { if (y) saveCurrent(true); });
+        var under = r.business && r.business !== b.business ? ', filed under ' + r.business : '';
+        return ask('This bill is already in the sheet: same ' + (b.kind === 'order' ? 'invoice number' : 'supplier and bill number') + under + '. Add it again' + (under ? ' under ' + b.business : '') + '?', 'Add again', 'Do not add').then(function (y) { if (y) saveCurrent(true); });
       }
       if (r.status !== 'added') throw new Error(r.error || 'The sheet did not accept this bill.');
       var g = String(b.gstin || '').toUpperCase(); if (E.gstinValid(g)) S.parties[b.kind][g] = String(b.party).trim();
@@ -1568,6 +1591,7 @@ function orderHelp() {
 function addFiles(list) {
   var files = Array.prototype.slice.call(list || []);
   if (!files.length) return;
+  if (!needBiz()) return;
   var pdf = files.filter(isPdf)[0];
   if (pdf) {
     if (files.length > 1 || S.pages.length) toast('A PDF is read as one whole bill, on its own. The photos were set aside.', 5000);
@@ -1593,6 +1617,7 @@ function describe(b, c) { return [b.party || 'No name', b.billNo || 'no number',
 function drawBatch() {
   var n = { added: 0, duplicate: 0, waiting: 0, failed: 0 }, left = 0;
   S.batch.forEach(function (it) { if (n[it.status] != null) n[it.status]++; else left++; });
+  $('batchTitle').textContent = 'Order invoices' + (S.batch.length && S.batch[S.batch.length - 1].biz ? ': ' + S.batch[S.batch.length - 1].biz : (bizOk(S.biz) ? ': ' + S.biz : ''));
   $('cAdded').textContent = n.added; $('cDup').textContent = n.duplicate; $('cWait').textContent = n.waiting; $('cFail').textContent = n.failed;
   $('batchSub').textContent = left ? 'Reading ' + Math.min(S.batch.length, S.batch.length - left + 1) + ' of ' + S.batch.length + (geminiOn() ? ' with Gemini' : '') + '. Keep this page open.' : (S.batch.length + (S.batch.length === 1 ? ' file' : ' files') + ' done.' + (n.waiting ? ' Open each waiting file to check and save it.' : ''));
   var lab = { queued: ['plain', 'In line'], reading: ['plain', 'Reading'], saving: ['plain', 'Saving'], added: ['ok', 'Added'], duplicate: ['plain', 'Already in sheet'], waiting: ['wait', 'Waiting'], failed: ['bad', 'Not read'] };
@@ -1606,8 +1631,9 @@ var batchRunning = false;
 function addOrders(list) {
   var files = Array.prototype.slice.call(list || []);
   if (!files.length) return;
+  if (!needBiz()) return;
   files.forEach(function (f) {
-    if (isPdf(f)) S.batch.push({ file: f, name: f.name || 'file', status: 'queued', detail: '' });
+    if (isPdf(f)) S.batch.push({ file: f, name: f.name || 'file', status: 'queued', detail: '', biz: S.biz });
     else S.batch.push({ file: null, name: f.name || 'file', status: 'failed', detail: 'Only PDF files are read here.' });
   });
   drawBatch(); show('batch');
@@ -1624,6 +1650,11 @@ function runBatch() {
       send.forEach(function (x, i) {
         var r = j.results[i] || { status: 'error' };
         if (r.status === 'added') { x.it.status = 'added'; x.it.bill = null; var g = x.pay.gstin; if (E.gstinValid(g)) S.parties.order[g] = x.pay.party; S.log.unshift({ label: 'Invoice ' + x.pay.billNo + ', ' + x.pay.party, amt: x.pay.total }); }
+        else if (r.status === 'duplicate' && r.business && r.business !== x.pay.business) {
+          /* the same invoice number sits under the other business: never skip it silently, never add it silently */
+          x.it.status = 'waiting';
+          x.it.detail = 'Invoice number ' + x.pay.billNo + ' is already in the sheet under ' + r.business + '. Open it only if it also belongs under ' + x.pay.business + '. ' + x.it.detail;
+        }
         else if (r.status === 'duplicate') { x.it.status = 'duplicate'; x.it.bill = null; }
         else { x.it.status = 'waiting'; x.it.detail = (r.error || 'The sheet did not accept it.') + ' ' + x.it.detail; }
       });
@@ -1635,13 +1666,13 @@ function runBatch() {
     if (!it) return flush().then(function () { batchRunning = false; drawBatch(); if (S.batch.some(function (x) { return x.status === 'queued'; })) runBatch(); });
     it.status = 'reading'; drawBatch();
     var progress = function (text) { it.detail = text; drawBatch(); };
-    return readBill({ file: it.file }, 'order', S.orderMonth === 'auto' ? null : hint(), progress).then(function (b) {
+    return readBill({ file: it.file }, 'order', S.orderMonth === 'auto' ? null : hint(), progress, it.biz).then(function (b) {
       it.file = null;
       if (S.orderMonth === 'auto') { b.month = b.date ? Number(b.date.slice(5, 7)) : 'auto'; b.year = b.date ? Number(b.date.slice(0, 4)) : S.year; } else { b.month = S.orderMonth; b.year = S.year; }
       var rv = review(b.month === 'auto' ? Object.assign({}, b, { month: S.month }) : b);
       it.detail = describe(b, rv.c);
       var clean = !rv.block.length && rv.state === 'ok' && b.partySure && !rv.warn.length && b.digital && !b.notes.length;
-      if (clean && S.settings.autoOrders) { pending.push({ it: it, pay: payload(b, rv) }); it.status = 'saving'; } /* digital PDFs are filed as they are */
+      if (clean && S.settings.autoOrders) { it.bill = b; pending.push({ it: it, pay: payload(b, rv) }); it.status = 'saving'; } /* digital PDFs are filed as they are */
       else {
         it.status = 'waiting'; it.bill = b;
         var why = rv.block[0] || (rv.state === 'off' ? 'Rows and total differ by ₹' + money(Math.abs(rv.c.diff)) + '.' : rv.state === 'nototal' ? 'Total not found.' : (rv.warn[0] || b.notes[0] || (!S.settings.autoOrders ? 'Waiting for your check.' : 'Customer name needs a look.')));
@@ -1683,14 +1714,14 @@ function saveSettings() {
 function prepConnect() {
   $('urlBlock').hidden = !!S.url; $('btnChangeUrl').hidden = !S.url; $('inUrl').value = S.url || ''; $('inPass').value = ''; $('connectErr').hidden = true;
 }
-var PAGE = '1.8';
-var NEEDS = '1.3.0';
+var PAGE = '1.9';
+var NEEDS = '1.4.0';
 function older(a, b) { var x = String(a || '0').split('.'), y = String(b).split('.'); for (var i = 0; i < 3; i++) { var d = (Number(x[i]) || 0) - (Number(y[i]) || 0); if (d) return d < 0; } return false; }
 function enter(j) {
   S.backend = S.demo ? NEEDS : (j.version || '1.0.0');
   S.oldBackend = older(S.backend, NEEDS);
   $('oldBackend').hidden = !S.oldBackend;
-  $('oldBackend').textContent = 'The script published in your Google Sheet is version ' + S.backend + ', older than this page (' + NEEDS + '). Bills still save, but without the newer speed and retry changes. To publish the new script: in Apps Script choose Deploy > Manage deployments, tap the pencil, set Version to New version, then Deploy.';
+  $('oldBackend').textContent = 'The script published in your Google Sheet is version ' + S.backend + ', older than this page (' + NEEDS + '). Bills still save, but the Business column in the sheet stays empty until the new script is published. To publish the new script: in Apps Script choose Deploy > Manage deployments, tap the pencil, set Version to New version, then Deploy.';
   S.settings = Object.assign(S.settings, j.settings || {}); S.parties = j.parties || { purchase: {}, order: {} };
   if (!S.parties.purchase) S.parties.purchase = {}; if (!S.parties.order) S.parties.order = {};
   $('demoNote').hidden = !S.demo; setKind(S.kind); drawPages(); drawLog(); show('home');
@@ -1720,6 +1751,8 @@ function signOut() {
 /* ---------- wiring ---------- */
 function wire() {
   fillSelect($('selYear'), yearOpts(), S.year);
+  var lastBiz = store.get('p9.biz'); S.biz = bizOk(lastBiz) ? lastBiz : '';
+  fillSelect($('selBiz'), bizOpts(), S.biz); fillSelect($('rBiz'), bizOpts(), '');
   $('fConnect').addEventListener('submit', signIn);
   $('btnChangeUrl').onclick = function () { $('urlBlock').hidden = false; $('btnChangeUrl').hidden = true; $('inUrl').focus(); };
   $('btnDemo').onclick = function () { S.demo = true; S.token = 'demo'; enter({ settings: { myGstin: '', myName: 'Print9', useGemini: false, saveScans: false, autoOrders: true, hasGeminiKey: false }, parties: { purchase: {}, order: {} } }); };
@@ -1731,8 +1764,14 @@ function wire() {
   $('inPick').onchange = function () { addFiles(this.files); this.value = ''; };
   $('inOrders').onchange = function () { addOrders(this.files); this.value = ''; };
   $('pages').onclick = function (e) { var i = e.target.getAttribute('data-rm'); if (i != null) { S.pages.splice(Number(i), 1); drawPages(); } };
-  $('btnRead').onclick = function () { if (S.pages.length) runPurchase({ pages: S.pages }); };
-  $('btnManual').onclick = function () { openReview(blankBill('purchase'), { from: 'home' }); };
+  $('btnRead').onclick = function () { if (S.pages.length && needBiz()) runPurchase({ pages: S.pages }); };
+  $('btnManual').onclick = function () { if (needBiz()) openReview(blankBill('purchase'), { from: 'home' }); };
+  $('selBiz').onchange = function () { S.biz = bizOk(this.value) ? this.value : ''; if (S.biz) store.set('p9.biz', S.biz); else store.del('p9.biz'); };
+  $('rBiz').onchange = function () { if (S.bill) { S.bill.business = bizOk(this.value) ? this.value : ''; refresh(); } };
+  /* no camera or file picker until the business is chosen */
+  Array.prototype.forEach.call(document.querySelectorAll('label[for=inCamera],label[for=inPick],label[for=inOrders]'), function (lab) {
+    lab.addEventListener('click', function (e) { if (!needBiz()) e.preventDefault(); });
+  });
 
   $('btnBack').onclick = function () { if (S.ctx && S.ctx.from === 'batch') { drawBatch(); show('batch'); } else show('home'); };
   $('viewer').onclick = function () { this.classList.toggle('zoom'); };
