@@ -212,9 +212,9 @@ body.typing .tally{position:static}
     </div>
 
     <div id="blockOrder" class="stack" hidden>
-      <label class="btn main" for="inOrders">Choose invoice files</label>
-      <input class="vh" type="file" id="inOrders" accept="application/pdf,image/*" multiple>
-      <p class="sub">Pick as many as you like. Each file is read on this device and added to the Invoices tab. A file that does not add up waits for you.</p>
+      <label class="btn main" for="inOrders">Choose invoice PDFs</label>
+      <input class="vh" type="file" id="inOrders" accept="application/pdf,.pdf" multiple>
+      <p class="sub" id="orderHelp"></p>
     </div>
   </div>
 
@@ -299,7 +299,7 @@ body.typing .tally{position:static}
   </div>
   <ul class="files" id="batchList"></ul>
   <div class="pair" style="margin-top:16px">
-    <label class="btn" for="inOrders">Add more files</label>
+    <label class="btn" for="inOrders">Add more PDFs</label>
     <button class="btn main" type="button" id="btnBatchDone">Done</button>
   </div>
 </section>
@@ -323,7 +323,7 @@ body.typing .tally{position:static}
     <label class="f">Gemini API key <span class="pill plain" id="keyTag" style="margin-left:6px"></span>
       <input type="password" id="sKey" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="Paste a new key to replace the saved one">
     </label>
-    <p class="help">The key is stored inside your Google account, never on this page. Digital PDFs are always read on this device.</p>
+    <p class="help">The key is stored inside your Google account, never on this page. Order invoice PDFs are sent to Gemini when it is switched on. Purchase PDFs with selectable text are read on this device.</p>
     <label class="switch"><input type="checkbox" id="sFast"><span>Use the lighter, faster Gemini model<small>Quicker answers. It may misread more on untidy bills, so compare the first few closely.</small></span></label>
     <button class="btn" type="button" id="btnTestKey">Test the saved key</button>
 
@@ -1257,8 +1257,80 @@ function fromGemini(d, kind) {
   });
   if (rows.length) b.rows = rows;
   b.total = toNum(d.grand_total);
+  b.inclusive = incl;
   if (incl) b.notes.push('Prices on this bill include GST; taxable values were worked back from them.');
   return b;
+}
+function geminiOn() { return !!(S.settings.useGemini && S.settings.hasGeminiKey && !S.demo); }
+function askGemini(kind, files) { return api('aiRead', { kind: kind, files: files }).then(function (j) { var gb = fromGemini(j.data || {}, kind); gb.aiMs = j.ms || 0; return gb; }); }
+function geminiBusy(e) { return /quota|rate.?limit|exhaust|\b429\b|overload|unavailable|\b503\b/i.test(String(e && e.message)); }
+function niceDate(iso) { var m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(iso || '')); return m ? Number(m[3]) + ' ' + MONTHS[Number(m[2]) - 1] + ' ' + m[1] : String(iso || ''); }
+function flatText(s) { return String(s == null ? '' : s).toUpperCase().replace(/[^0-9A-Z]/g, ''); }
+
+/*
+ * A digital PDF carries its own exact text. Whatever Gemini reads from an order invoice is checked against it:
+ * a figure, number or name that is not in the PDF's text was misread or made up, and the invoice then waits for a person.
+ */
+function textFacts(lines) {
+  var nums = {}, dates = {}, all = '';
+  lines.forEach(function (ln) {
+    all += ' ' + ln;
+    String(ln).replace(/[|]/g, ' ').split(/\s+/).forEach(function (tok) { var n = E.parseNum(tok); if (n) nums[Math.round(Math.abs(n.v) * 100)] = 1; });
+    E.datesInLine(ln).forEach(function (d) { dates[d.date.iso] = 1; });
+  });
+  return { nums: nums, dates: dates, flat: flatText(all) };
+}
+function confirmWithText(b, lines) {
+  var f = textFacts(lines), out = [], paise = function (v) { return Math.round(Math.abs(Number(v)) * 100); };
+  var my = flatText(S.settings.myGstin);
+  if (my && f.flat.indexOf(my) < 0) out.push('Your GSTIN is not in this PDF. Check that it is one of your own invoices.');
+  var no = flatText(b.billNo);
+  if (no && f.flat.indexOf(no) < 0) out.push('Invoice number ' + b.billNo + ' was not found in the PDF text.');
+  if (b.gstin && f.flat.indexOf(flatText(b.gstin)) < 0) out.push('Customer GSTIN ' + b.gstin + ' was not found in the PDF text.');
+  var words = String(b.party || '').toUpperCase().split(/[^0-9A-Z]+/).filter(function (w) { return w.length >= 3; });
+  if (words.some(function (w) { return f.flat.indexOf(w) < 0; })) out.push('Customer name "' + b.party + '" was not found in the PDF text.');
+  if (b.date && Object.keys(f.dates).length && !f.dates[b.date]) out.push('Invoice date ' + niceDate(b.date) + ' was not found in the PDF text.');
+  if (b.total != null && !f.nums[paise(b.total)]) out.push('Invoice total ' + money(b.total) + ' was not found in the PDF text.');
+  if (!b.inclusive) {
+    var rows = b.rows.filter(function (r) { return toNum(r.taxable); });
+    var miss = rows.filter(function (r) { return !f.nums[paise(r.taxable)]; }).length;
+    if (miss) out.push(miss + ' of ' + rows.length + (rows.length === 1 ? ' row amount was' : ' row amounts were') + ' not found in the PDF text.');
+  }
+  return out;
+}
+var AI_WAIT = 20000;
+/* Gemini's free quota allows only so many reads a minute. When it says it is at its limit, wait and ask again, twice at most. */
+function askPatiently(files, step) {
+  var waits = S.aiTired ? [] : [AI_WAIT, AI_WAIT * 2];
+  function go(i) {
+    return askGemini('order', files).then(function (gb) { S.aiTired = false; return gb; }, function (e) {
+      if (!geminiBusy(e)) throw e;
+      if (i >= waits.length) { S.aiTired = true; throw e; }
+      step('Gemini is at its limit. Trying again in ' + Math.round(waits[i] / 1000) + ' seconds', 0.5);
+      return wait(waits[i]).then(function () { return go(i + 1); });
+    });
+  }
+  return go(0);
+}
+function pdfToAi() { var at = Number(store.get('p9.noPdfAi') || 0); return !(at && Date.now() - at < 7 * 86400000); }
+function readOrderWithGemini(ctx, step) {
+  var pics = ctx.aiFiles.slice(0, 6);
+  var whole = ctx.digital && pdfToAi() && ctx.files.length && ctx.files[0].mime === 'application/pdf' && ctx.files[0].b64.length <= 5600000 ? [ctx.files[0]] : null;
+  var first = whole || pics;
+  return askPatiently(first, step).catch(function (e) {
+    /* if the PDF itself did not go through, send pictures of its pages; if Gemini refused the format, keep doing that for a week */
+    if (!whole || !pics.length || geminiBusy(e)) throw e;
+    step('Sending page pictures to Gemini', 0.6);
+    var refused = /mime|unsupported|pdf|document|invalid/i.test(String(e && e.message));
+    return askGemini('order', pics).then(function (gb) { if (refused) store.set('p9.noPdfAi', String(Date.now())); return gb; });
+  }).then(function (gb) {
+    if (ctx.digital) {
+      ctx.raw = ctx.lines;
+      var issues = confirmWithText(gb, ctx.lines);
+      gb.confirmed = !issues.length; gb.notes = gb.notes.concat(issues);
+    } else gb.notes.push('This PDF is a scan with no text inside, so the reading could not be confirmed against it. Compare each figure with the invoice.');
+    return gb;
+  });
 }
 /* input: { pages:[{dataUrl,name}] } or { file: File(pdf) } */
 function readBill(input, kind, hint, step) {
@@ -1295,7 +1367,9 @@ function readBill(input, kind, hint, step) {
     p = Promise.resolve();
   }
   return p.then(function () {
-    if (ctx.digital) { ctx.raw = ctx.lines; return fromEngine(E.parseBill(ctx.lines, opts), kind); }
+    var localText = function () { ctx.raw = ctx.lines; return fromEngine(E.parseBill(ctx.lines, opts), kind); };
+    var orderAi = kind === 'order' && geminiOn();
+    if (ctx.digital && !orderAi) return localText();
     var localRead = function () {
       var chain = Promise.resolve(), all = [], n = ctx.pages.length;
       ctx.pages.forEach(function (pg, i) {
@@ -1306,9 +1380,19 @@ function readBill(input, kind, hint, step) {
       });
       return chain.then(function () { ctx.raw = all; return fromEngine(E.parseBill(all, opts), kind); });
     };
-    if (S.settings.useGemini && S.settings.hasGeminiKey && !S.demo) {
+    if (orderAi) {
       step('Sending to Gemini', 0.4);
-      return api('aiRead', { kind: kind, files: ctx.aiFiles.slice(0, 6) }).then(function (j) { var gb = fromGemini(j.data || {}, kind); gb.aiMs = j.ms || 0; return gb; })
+      return readOrderWithGemini(ctx, step).catch(function (e) {
+        step('Gemini did not answer. Using the built-in reader', 0.7);
+        return (ctx.digital ? Promise.resolve(localText()) : localRead()).then(function (lb) {
+          lb.notes.unshift('Gemini could not read this file (' + e.message + '), so the built-in reader was used. Compare each figure with the invoice.');
+          return lb;
+        });
+      });
+    }
+    if (geminiOn()) {
+      step('Sending to Gemini', 0.4);
+      return askGemini(kind, ctx.aiFiles.slice(0, 6))
         .catch(function (e) { toast('Gemini could not read it (' + e.message + '). Using the built-in reader.', 6000); return localRead(); });
     }
     return localRead();
@@ -1392,6 +1476,7 @@ function openReview(b, ctx) {
   $('revTitle').textContent = order ? 'Check the order invoice' : 'Check the purchase bill';
   var secs = function (ms) { return Math.max(1, Math.round(ms / 1000)) + ' s'; };
   var how = b.readBy === 'Gemini' ? 'Read by Gemini' + (b.readMs ? ' in ' + secs(b.readMs) + (b.aiMs ? ', of which Gemini itself took ' + secs(b.aiMs) : '') : '') : 'Read on this device' + (b.readMs ? ' in ' + secs(b.readMs) : '');
+  if (b.confirmed) how += '. Its figures were found in the PDF text';
   $('revSub').textContent = b.readBy === 'Typed' ? 'Type the details from the bill.' : how + '. Compare each figure with the bill before saving.';
   $('lblParty').textContent = order ? 'Customer' : 'Supplier';
   $('btnAddCharge').textContent = order ? 'Add delivery' : 'Add transport';
@@ -1472,8 +1557,14 @@ function setKind(k) {
   $('blockPurchase').hidden = k !== 'purchase'; $('blockOrder').hidden = k !== 'order';
   fillSelect($('selMonth'), monthOpts(k === 'order'), k === 'order' ? S.orderMonth : S.month);
   $('selYear').disabled = k === 'order' && S.orderMonth === 'auto';
+  orderHelp();
 }
 function hint() { return { m: S.month, y: S.year }; }
+function orderHelp() {
+  $('orderHelp').textContent = geminiOn()
+    ? 'Pick as many PDFs as you like. Gemini reads each one. The reading is then checked against the PDF text and the totals, and added to the Invoices tab. A file that fails any check waits for you.'
+    : (S.demo ? 'Trial mode: invoices are read by the built-in reader and nothing is saved.' : 'Gemini is switched off, so invoices are read by the built-in reader. To use Gemini here, switch it on in Settings.');
+}
 function addFiles(list) {
   var files = Array.prototype.slice.call(list || []);
   if (!files.length) return;
@@ -1503,7 +1594,7 @@ function drawBatch() {
   var n = { added: 0, duplicate: 0, waiting: 0, failed: 0 }, left = 0;
   S.batch.forEach(function (it) { if (n[it.status] != null) n[it.status]++; else left++; });
   $('cAdded').textContent = n.added; $('cDup').textContent = n.duplicate; $('cWait').textContent = n.waiting; $('cFail').textContent = n.failed;
-  $('batchSub').textContent = left ? 'Reading ' + (S.batch.length - left + 1) + ' of ' + S.batch.length + '. Keep this page open.' : (S.batch.length + (S.batch.length === 1 ? ' file' : ' files') + ' done.' + (n.waiting ? ' Open each waiting file to check and save it.' : ''));
+  $('batchSub').textContent = left ? 'Reading ' + Math.min(S.batch.length, S.batch.length - left + 1) + ' of ' + S.batch.length + (geminiOn() ? ' with Gemini' : '') + '. Keep this page open.' : (S.batch.length + (S.batch.length === 1 ? ' file' : ' files') + ' done.' + (n.waiting ? ' Open each waiting file to check and save it.' : ''));
   var lab = { queued: ['plain', 'In line'], reading: ['plain', 'Reading'], saving: ['plain', 'Saving'], added: ['ok', 'Added'], duplicate: ['plain', 'Already in sheet'], waiting: ['wait', 'Waiting'], failed: ['bad', 'Not read'] };
   $('batchList').innerHTML = S.batch.map(function (it, i) {
     var l = lab[it.status] || lab.queued;
@@ -1515,7 +1606,10 @@ var batchRunning = false;
 function addOrders(list) {
   var files = Array.prototype.slice.call(list || []);
   if (!files.length) return;
-  files.forEach(function (f) { S.batch.push({ file: f, name: f.name || 'file', status: 'queued', detail: '' }); });
+  files.forEach(function (f) {
+    if (isPdf(f)) S.batch.push({ file: f, name: f.name || 'file', status: 'queued', detail: '' });
+    else S.batch.push({ file: null, name: f.name || 'file', status: 'failed', detail: 'Only PDF files are read here.' });
+  });
   drawBatch(); show('batch');
   if (!batchRunning) runBatch();
 }
@@ -1540,8 +1634,8 @@ function runBatch() {
     var it = S.batch.filter(function (x) { return x.status === 'queued'; })[0];
     if (!it) return flush().then(function () { batchRunning = false; drawBatch(); if (S.batch.some(function (x) { return x.status === 'queued'; })) runBatch(); });
     it.status = 'reading'; drawBatch();
-    var input = isPdf(it.file) ? Promise.resolve({ file: it.file }) : imageToPage(it.file).then(function (pg) { return { pages: [pg] }; });
-    return input.then(function (inp) { return readBill(inp, 'order', S.orderMonth === 'auto' ? null : hint(), function () {}); }).then(function (b) {
+    var progress = function (text) { it.detail = text; drawBatch(); };
+    return readBill({ file: it.file }, 'order', S.orderMonth === 'auto' ? null : hint(), progress).then(function (b) {
       it.file = null;
       if (S.orderMonth === 'auto') { b.month = b.date ? Number(b.date.slice(5, 7)) : 'auto'; b.year = b.date ? Number(b.date.slice(0, 4)) : S.year; } else { b.month = S.orderMonth; b.year = S.year; }
       var rv = review(b.month === 'auto' ? Object.assign({}, b, { month: S.month }) : b);
@@ -1550,7 +1644,7 @@ function runBatch() {
       if (clean && S.settings.autoOrders) { pending.push({ it: it, pay: payload(b, rv) }); it.status = 'saving'; } /* digital PDFs are filed as they are */
       else {
         it.status = 'waiting'; it.bill = b;
-        var why = rv.block[0] || (rv.state === 'off' ? 'Rows and total differ by ₹' + money(Math.abs(rv.c.diff)) + '.' : rv.state === 'nototal' ? 'Total not found.' : (!b.digital ? 'Read from a picture, so it needs your eye.' : (rv.warn[0] || b.notes[0] || (!S.settings.autoOrders ? 'Waiting for your check.' : 'Customer name needs a look.'))));
+        var why = rv.block[0] || (rv.state === 'off' ? 'Rows and total differ by ₹' + money(Math.abs(rv.c.diff)) + '.' : rv.state === 'nototal' ? 'Total not found.' : (rv.warn[0] || b.notes[0] || (!S.settings.autoOrders ? 'Waiting for your check.' : 'Customer name needs a look.')));
         it.detail = why + ' ' + it.detail;
       }
       drawBatch();
@@ -1581,7 +1675,7 @@ function saveSettings() {
   if (key) data.geminiKey = key;
   store.set('p9.copy', $('sCopy').value);
   busy('Saving settings', 0.5);
-  api('saveSettings', data).then(function (j) { idle(); S.settings = j.settings; if (S.demo && key) S.settings.hasGeminiKey = true; toast('Settings saved'); show(S.back === 'review' && S.bill ? 'review' : (S.back === 'batch' ? 'batch' : 'home')); })
+  api('saveSettings', data).then(function (j) { idle(); S.settings = j.settings; if (S.demo && key) S.settings.hasGeminiKey = true; orderHelp(); toast('Settings saved'); show(S.back === 'review' && S.bill ? 'review' : (S.back === 'batch' ? 'batch' : 'home')); })
     .catch(function (e) { idle(); setMsg(e.message, true); });
 }
 
@@ -1589,7 +1683,7 @@ function saveSettings() {
 function prepConnect() {
   $('urlBlock').hidden = !!S.url; $('btnChangeUrl').hidden = !S.url; $('inUrl').value = S.url || ''; $('inPass').value = ''; $('connectErr').hidden = true;
 }
-var PAGE = '1.7';
+var PAGE = '1.8';
 var NEEDS = '1.3.0';
 function older(a, b) { var x = String(a || '0').split('.'), y = String(b).split('.'); for (var i = 0; i < 3; i++) { var d = (Number(x[i]) || 0) - (Number(y[i]) || 0); if (d) return d < 0; } return false; }
 function enter(j) {
